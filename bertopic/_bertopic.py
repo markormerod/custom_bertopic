@@ -20,8 +20,7 @@ import scipy.sparse as sp
 from tqdm import tqdm
 from pathlib import Path
 from packaging import version
-from tempfile import TemporaryDirectory
-from collections import defaultdict, Counter
+from collections import defaultdict
 from scipy.sparse import csr_matrix
 from scipy.cluster import hierarchy as sch
 from scipy.spatial.distance import squareform
@@ -146,7 +145,7 @@ class BERTopic:
                       model for "english" is `all-MiniLM-L6-v2`. For a full overview of
                       supported languages see bertopic.backend.languages. Select
                       "multilingual" to load in the `paraphrase-multilingual-MiniLM-L12-v2`
-                      sentence-transformers model that supports 50+ languages.
+                      sentence-tranformers model that supports 50+ languages.
                       NOTE: This is not used if `embedding_model` is used. 
             top_n_words: The number of words per topic to extract. Setting this
                          too high can negatively impact topic embeddings as topics
@@ -876,7 +875,7 @@ class BERTopic:
         return topics_per_class
 
     def hierarchical_topics(self,
-                            docs: List[str],
+                            docs: List[int],
                             linkage_function: Callable[[csr_matrix], np.ndarray] = None,
                             distance_function: Callable[[csr_matrix], csr_matrix] = None) -> pd.DataFrame:
         """ Create a hierarchy of topics
@@ -1381,8 +1380,6 @@ class BERTopic:
                           "manually assigning topics is the last step in the pipeline."
                           "Note that topic embeddings will also be created through weighted"
                           "c-TF-IDF embeddings instead of centroid embeddings.")
-
-        self._outliers = 1 if -1 in set(topics) else 0
         # Extract words
         documents = pd.DataFrame({"Document": docs, "Topic": topics, "ID": range(len(docs)), "Image": images})
         documents_per_topic = documents.groupby(['Topic'], as_index=False).agg({'Document': ' '.join})
@@ -1483,7 +1480,7 @@ class BERTopic:
         if self.topic_aspects_:
             for aspect, values in self.topic_aspects_.items():
                 if isinstance(list(values.values())[-1], list):
-                    if isinstance(list(values.values())[-1][0], tuple) or isinstance(list(values.values())[-1][0], list):
+                    if isinstance(list(values.values())[-1][0], tuple):
                         values = {topic: list(list(zip(*value))[0]) for topic, value in values.items()}
                     elif isinstance(list(values.values())[-1][0], str):
                         values = {topic: " ".join(value).strip() for topic, value in values.items()}
@@ -2013,7 +2010,7 @@ class BERTopic:
                         images: List[str] = None,
                         strategy: str = "distributions",
                         probabilities: np.ndarray = None,
-                        threshold: float = 0,
+                        threshold: int = 0,
                         embeddings: np.ndarray = None,
                         distributions_params: Mapping[str, Any] = {}) -> List[int]:
         """ Reduce outliers by merging them with their nearest topic according
@@ -2102,7 +2099,7 @@ class BERTopic:
 
         # Reduce outliers by extracting most likely topics through the topic-term probability matrix
         if strategy.lower() == "probabilities":
-            new_topics = [np.argmax(prob) if np.max(prob) >= threshold and topic == -1 else topic
+            new_topics = [np.argmax(prob) if max(prob) >= threshold and topic == -1 else topic
                           for topic, prob in zip(topics, probabilities)]
 
         # Reduce outliers by extracting most frequent topics through calculating of Topic Distributions
@@ -3016,124 +3013,6 @@ class BERTopic:
 
         return topic_model
 
-    @classmethod
-    def merge_models(cls, models, min_similarity: float = .7, embedding_model=None):
-        """ Merge multiple pre-trained BERTopic models into a single model.
-
-        The models are merged as if they were all saved using pytorch or
-        safetensors, so a minimal version without c-TF-IDF.
-
-        To do this, we choose the first model in the list of
-        models as a baseline. Then, we check for each model
-        whether they contain topics that are not in the baseline.
-        This check if based on the cosine similarity between
-        topics embeddings. If topic embeddings between two models
-        are similar, then the topic of the second model are re-assigned
-        to the first. If they are dissimilar, the topic of the second
-        model is assigned to the first.
-
-        In essence, we simply check whether sufficiently "new"
-        topics emerge and add them.
-
-        Arguments:
-            models: A list of fitted BERTopic models
-            min_similarity: The minimum similarity for when topics are merged.
-            embedding_model: Additionally load in an embedding model if necessary.
-
-        Returns:
-            A new BERTopic model that was created as if you were
-            loading a model from the HuggingFace Hub without c-TF-IDF
-
-        Examples:
-
-        ```python
-        from bertopic import BERTopic
-        from sklearn.datasets import fetch_20newsgroups
-
-        docs = fetch_20newsgroups(subset='all',  remove=('headers', 'footers', 'quotes'))['data']
-
-        # Create three separate models
-        topic_model_1 = BERTopic(min_topic_size=5).fit(docs[:4000])
-        topic_model_2 = BERTopic(min_topic_size=5).fit(docs[4000:8000])
-        topic_model_3 = BERTopic(min_topic_size=5).fit(docs[8000:])
-
-        # Combine all models into one
-        merged_model = BERTopic.merge_models([topic_model_1, topic_model_2, topic_model_3])
-        ```
-        """
-        import torch
-
-        # Temporarily save model and push to HF
-        with TemporaryDirectory() as tmpdir:
-
-            # Save model weights and config.
-            all_topics, all_params, all_tensors  = [], [], []
-            for index, model in enumerate(models):
-                model.save(tmpdir, serialization="pytorch")
-                topics, params, tensors, _, _, _ = save_utils.load_local_files(Path(tmpdir))
-                all_topics.append(topics)
-                all_params.append(params)
-                all_tensors.append(np.array(tensors["topic_embeddings"]))
-
-                # Create a base set of parameters
-                if index == 0:
-                    merged_topics = topics
-                    merged_params = params
-                    merged_tensors = np.array(tensors["topic_embeddings"])
-                    merged_topics["custom_labels"] = None
-
-        for tensors, selected_topics in zip(all_tensors[1:], all_topics[1:]):
-            # Calculate similarity matrix
-            sim_matrix = cosine_similarity(tensors, merged_tensors)
-            sims = np.max(sim_matrix, axis=1)
-            min_similarity = 0.7
-
-            # Extract new topics
-            new_topics = sorted([index - selected_topics["_outliers"] for index, sim in enumerate(sims) if sim < min_similarity])
-            max_topic = max(set(merged_topics["topics"]))
-
-            # Merge Topic Representations
-            new_topics_dict = {}
-            for index, new_topic in enumerate(new_topics):
-                new_topic_val = max_topic + index + 1
-                new_topics_dict[new_topic] = new_topic_val
-                merged_topics["topic_representations"][str(new_topic_val)] = selected_topics["topic_representations"][str(new_topic)]
-                merged_topics["topic_labels"][str(new_topic_val)] = selected_topics["topic_labels"][str(new_topic)]
-
-                if selected_topics["topic_aspects"]:
-                    merged_topics["topic_aspects"][str(new_topic_val)] = selected_topics["topic_aspects"][str(new_topic)]
-
-                # Add new embeddings
-                new_tensors = tensors[new_topic - selected_topics["_outliers"]]
-                merged_tensors = np.vstack([merged_tensors, new_tensors])
-
-            # Topic Mapper
-            merged_topics["topic_mapper"] = TopicMapper(list(range(-1, new_topic_val+1, 1)))
-
-            # Find similar topics and re-assign those from the new models
-            sims_idx = np.argmax(sim_matrix, axis=1)
-            sims = np.max(sim_matrix, axis=1)
-            to_merge = {
-                a- selected_topics["_outliers"]: 
-                b - merged_topics["_outliers"] for a, (b, val) in enumerate(zip(sims_idx, sims)) 
-                if val >= min_similarity
-            }
-            to_merge.update(new_topics_dict)
-            to_merge[-1] = -1
-            topics  = [to_merge[topic] for topic in selected_topics["topics"]]
-            merged_topics["topics"].extend(topics)
-            merged_topics["topic_sizes"] = dict(Counter(merged_topics["topics"]))
-
-        # Create a new model from the merged parameters
-        merged_tensors = {"topic_embeddings": torch.from_numpy(merged_tensors)}
-        merged_model = _create_model_from_files(merged_topics, merged_params, merged_tensors, None, None, None)
-        merged_model.embedding_model = models[0].embedding_model
-
-        # Replace embedding model if one is specifically chosen
-        if embedding_model is not None and type(merged_model.embedding_model) == BaseEmbedder:
-            merged_model.embedding_model = select_backend(embedding_model)
-        return merged_model
-
     def push_to_hf_hub(
             self,
             repo_id: str,
@@ -3301,8 +3180,6 @@ class BERTopic:
         # Regular fit
         else:
             try:
-                # cuml umap needs y to be an numpy array
-                y = np.array(y) if y is not None else None
                 self.umap_model.fit(embeddings, y=y)
             except TypeError:
                 logger.info("The dimensionality reduction algorithm did not contain the `y` parameter and"
@@ -3337,10 +3214,15 @@ class BERTopic:
             documents['Topic'] = labels
             self.topics_ = labels
         else:
-            try:
-                self.hdbscan_model.fit(umap_embeddings, y=y)
-            except TypeError:
-                self.hdbscan_model.fit(umap_embeddings)
+            if self.hdbscan_model.metric == 'precomputed':
+                # Takes
+                pair_wise_sim = self.pair_wise_sim_function(documents, umap_embeddings)
+                self.hdbscan_model.fit(pair_wise_sim)
+            else:
+                try:
+                    self.hdbscan_model.fit(umap_embeddings, y=y)
+                except TypeError:
+                    self.hdbscan_model.fit(umap_embeddings)
 
             try:
                 labels = self.hdbscan_model.labels_
